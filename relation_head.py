@@ -45,19 +45,44 @@ class RelationHead(nn.Module):
 
         self.equation_dim = equation_dim
 
-        pair_feature_dim = 4 * equation_dim
-        hidden = hidden_dim or 2 * equation_dim
-        bottleneck = bottleneck_dim or hidden
+        self.hidden_dim = hidden_dim or 128
+        self.bottleneck_dim = bottleneck_dim or self.hidden_dim
 
-        self.network = nn.Sequential(
-            nn.Linear(pair_feature_dim, hidden),
+        pair_feature_dim = 4 * equation_dim
+        self.relation_encoder = nn.Sequential(
+            nn.Linear(pair_feature_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, bottleneck),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(bottleneck, 1),
+            nn.Linear(self.hidden_dim, self.bottleneck_dim),
+            nn.Tanh(),
         )
+        self.classifier = nn.Sequential(
+            nn.Linear(self.bottleneck_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+
+        self._initialize_parameters()
+
+    def _initialize_parameters(self) -> None:
+        """Use a simple initialization convention for the MLP layers."""
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def relation_embedding(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        """Return the learned bottleneck vector for ordered pairs.
+
+        These bottleneck vectors are useful for inspection, but the clustering
+        workflow usually fingerprints equations by the relation logits they
+        receive against many anchor equations.
+        """
+
+        features = self.pair_features(left, right)
+        return self.relation_encoder(features)
 
     def pair_features(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
         """Return ordered pair features for `left` and `right`.
@@ -86,8 +111,8 @@ class RelationHead(nn.Module):
         They are intended for `torch.nn.BCEWithLogitsLoss`.
         """
 
-        features = self.pair_features(left, right)
-        return self.network(features).squeeze(-1)
+        relation = self.relation_embedding(left, right)
+        return self.classifier(relation).squeeze(-1)
 
 
 if __name__ == "__main__":

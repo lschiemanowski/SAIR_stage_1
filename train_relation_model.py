@@ -10,23 +10,22 @@ Positive examples are sampled from `implication_graph.json`. Negative examples
 are sampled as ordered equation pairs absent from that graph, using the
 assumption that the implication graph is complete.
 
-The current encoder is didactic and processes one equation tensor at a time.
-That keeps the code easy to inspect, but it is not the fastest possible way to
-train over millions of edges. A production version would batch node tensors or
-cache/recompute equation embeddings more carefully.
+A compiled syntax encoder produces one embedding per equation, and an ordered
+MLP with a small bottleneck scores pairs of equation embeddings. The
+implementation is still pedagogical: every stage is a named module, and the data
+flow stays close to the mathematical description.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from equation_level_encoder import EquationLevelEncoder
+from compiled_equation_encoder import CompiledEquationEncoder
 from implication_dataset import (
     DEFAULT_EQUATIONS,
     DEFAULT_GRAPH,
@@ -37,26 +36,27 @@ from implication_dataset import (
 from postfix_equation_tensor import EquationTensor
 from relation_head import RelationHead
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional convenience dependency
+    tqdm = None
+
 
 DEFAULT_CHECKPOINT = Path("relation_model.pt")
-
-
-@dataclass(frozen=True)
-class BatchEmbeddings:
-    lhs: torch.Tensor
-    rhs: torch.Tensor
 
 
 class ImplicationRelationModel(nn.Module):
     """End-to-end implication model.
 
-    The equation encoder is symmetric in the two sides of one equation because
-    it uses the learned symmetric bilinear aggregation. The relation head is
-    directional in the two equations, because implication is directional.
+    The equation encoder is symmetric in the two sides of one equation: it
+    aggregates the two root states with `[hL + hR ; |hL - hR|] -> MLP`. The
+    relation head is directional in the two equations, because implication is
+    directional.
     """
 
     def __init__(
         self,
+        equation_tensors: list[EquationTensor],
         max_variables: int,
         feature_dim: int,
         equation_dim: int,
@@ -67,7 +67,8 @@ class ImplicationRelationModel(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.equation_encoder = EquationLevelEncoder(
+        self.equation_encoder = CompiledEquationEncoder(
+            equation_tensors=equation_tensors,
             max_variables=max_variables,
             feature_dim=feature_dim,
             equation_dim=equation_dim,
@@ -80,48 +81,44 @@ class ImplicationRelationModel(nn.Module):
             dropout=dropout,
         )
 
-    def encode_pair_batch(
+    def encode_equations(self, indices: torch.Tensor) -> torch.Tensor:
+        """Return equation embeddings for equation indices."""
+
+        return self.equation_encoder.encode_indices(indices)
+
+    def encode_pair_embeddings(
         self,
-        equation_tensors: list[EquationTensor],
         lhs_indices: torch.Tensor,
         rhs_indices: torch.Tensor,
-    ) -> BatchEmbeddings:
-        """Encode all equations needed by one pair batch.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode the equations appearing in one ordered-pair batch."""
 
-        The same equation can appear many times in a batch. To avoid recomputing
-        it within that batch, this method keeps a tiny dictionary cache from
-        equation index to equation embedding.
-        """
+        combined_indices = torch.cat([lhs_indices, rhs_indices], dim=0)
+        combined_embeddings = self.equation_encoder.encode_indices(combined_indices)
+        split = lhs_indices.size(0)
+        return combined_embeddings[:split], combined_embeddings[split:]
 
-        embedding_cache: dict[int, torch.Tensor] = {}
-
-        def get_embedding(index: int) -> torch.Tensor:
-            if index not in embedding_cache:
-                encoding = self.equation_encoder(equation_tensors[index])
-                embedding_cache[index] = encoding.equation_embedding
-            return embedding_cache[index]
-
-        lhs_embeddings = torch.stack(
-            [get_embedding(int(index)) for index in lhs_indices.tolist()],
-            dim=0,
-        )
-        rhs_embeddings = torch.stack(
-            [get_embedding(int(index)) for index in rhs_indices.tolist()],
-            dim=0,
-        )
-
-        return BatchEmbeddings(lhs=lhs_embeddings, rhs=rhs_embeddings)
-
-    def forward(
+    def relation_embedding(
         self,
-        equation_tensors: list[EquationTensor],
         lhs_indices: torch.Tensor,
         rhs_indices: torch.Tensor,
     ) -> torch.Tensor:
+        """Return the learned relation bottleneck for equation-index pairs."""
+
+        lhs_embeddings, rhs_embeddings = self.encode_pair_embeddings(
+            lhs_indices,
+            rhs_indices,
+        )
+        return self.relation_head.relation_embedding(lhs_embeddings, rhs_embeddings)
+
+    def forward(self, lhs_indices: torch.Tensor, rhs_indices: torch.Tensor) -> torch.Tensor:
         """Return logits for a batch of ordered equation-index pairs."""
 
-        embeddings = self.encode_pair_batch(equation_tensors, lhs_indices, rhs_indices)
-        return self.relation_head(embeddings.lhs, embeddings.rhs)
+        lhs_embeddings, rhs_embeddings = self.encode_pair_embeddings(
+            lhs_indices,
+            rhs_indices,
+        )
+        return self.relation_head(lhs_embeddings, rhs_embeddings)
 
 
 def choose_device(device_name: str) -> torch.device:
@@ -137,13 +134,22 @@ def choose_device(device_name: str) -> torch.device:
     return torch.device("cpu")
 
 
+def progress_iterator(iterable, enabled: bool, desc: str):
+    """Wrap an iterable in tqdm when available and requested."""
+
+    if enabled and tqdm is not None:
+        return tqdm(iterable, desc=desc, leave=False)
+    return iterable
+
+
 def train_one_epoch(
     model: ImplicationRelationModel,
-    equation_tensors: list[EquationTensor],
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     loss_fn: nn.Module,
     device: torch.device,
+    show_progress: bool = False,
+    epoch: int | None = None,
 ) -> tuple[float, float]:
     """Train for one epoch and return `(average_loss, accuracy)`."""
 
@@ -153,12 +159,20 @@ def train_one_epoch(
     total_correct = 0
     total_examples = 0
 
-    for lhs_indices, rhs_indices, labels in loader:
+    iterator = progress_iterator(
+        loader,
+        enabled=show_progress,
+        desc=f"train epoch {epoch:03d}" if epoch is not None else "train",
+    )
+
+    for lhs_indices, rhs_indices, labels in iterator:
+        lhs_indices = lhs_indices.to(device=device, dtype=torch.long)
+        rhs_indices = rhs_indices.to(device=device, dtype=torch.long)
         labels = labels.to(device=device, dtype=torch.float32)
 
         optimizer.zero_grad(set_to_none=True)
 
-        logits = model(equation_tensors, lhs_indices, rhs_indices)
+        logits = model(lhs_indices, rhs_indices)
         loss = loss_fn(logits, labels)
         loss.backward()
         optimizer.step()
@@ -169,16 +183,23 @@ def train_one_epoch(
             total_examples += int(labels.numel())
             total_loss += float(loss.detach()) * int(labels.numel())
 
+        if hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(
+                loss=total_loss / total_examples,
+                acc=total_correct / total_examples,
+            )
+
     return total_loss / total_examples, total_correct / total_examples
 
 
 @torch.no_grad()
 def evaluate(
     model: ImplicationRelationModel,
-    equation_tensors: list[EquationTensor],
     loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
+    show_progress: bool = False,
+    epoch: int | None = None,
 ) -> tuple[float, float]:
     """Evaluate and return `(average_loss, accuracy)`."""
 
@@ -188,16 +209,30 @@ def evaluate(
     total_correct = 0
     total_examples = 0
 
-    for lhs_indices, rhs_indices, labels in loader:
+    iterator = progress_iterator(
+        loader,
+        enabled=show_progress,
+        desc=f"val epoch {epoch:03d}" if epoch is not None else "val",
+    )
+
+    for lhs_indices, rhs_indices, labels in iterator:
+        lhs_indices = lhs_indices.to(device=device, dtype=torch.long)
+        rhs_indices = rhs_indices.to(device=device, dtype=torch.long)
         labels = labels.to(device=device, dtype=torch.float32)
 
-        logits = model(equation_tensors, lhs_indices, rhs_indices)
+        logits = model(lhs_indices, rhs_indices)
         loss = loss_fn(logits, labels)
 
         predictions = (logits >= 0).to(labels.dtype)
         total_correct += int((predictions == labels).sum().item())
         total_examples += int(labels.numel())
         total_loss += float(loss.detach()) * int(labels.numel())
+
+        if hasattr(iterator, "set_postfix"):
+            iterator.set_postfix(
+                loss=total_loss / total_examples,
+                acc=total_correct / total_examples,
+            )
 
     return total_loss / total_examples, total_correct / total_examples
 
@@ -214,11 +249,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-samples", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--negative-ratio", type=int, default=1)
-    parser.add_argument("--feature-dim", type=int, default=64)
-    parser.add_argument("--equation-dim", type=int, default=64)
+    parser.add_argument("--feature-dim", type=int, default=256)
+    parser.add_argument("--equation-dim", type=int, default=None)
     parser.add_argument("--composition-hidden-dim", type=int, default=None)
-    parser.add_argument("--relation-hidden-dim", type=int, default=None)
-    parser.add_argument("--relation-bottleneck-dim", type=int, default=None)
+    parser.add_argument("--relation-hidden-dim", type=int, default=128)
+    parser.add_argument("--relation-bottleneck-dim", type=int, default=16)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -228,6 +263,11 @@ def parse_args() -> argparse.Namespace:
         "--no-save",
         action="store_true",
         help="Run training without writing a checkpoint.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars even when tqdm is installed.",
     )
     return parser.parse_args()
 
@@ -239,9 +279,15 @@ def main() -> None:
         raise ValueError("--epochs must be positive")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
+    if args.feature_dim <= 0:
+        raise ValueError("--feature-dim must be positive")
+    if args.equation_dim is not None and args.equation_dim <= 0:
+        raise ValueError("--equation-dim must be positive")
 
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
+    equation_dim = args.equation_dim or args.feature_dim
+    show_progress = not args.no_progress
 
     print(f"device: {device}")
     print(f"loading equations from {args.equations}")
@@ -255,6 +301,14 @@ def main() -> None:
     print(f"positive implication pairs: {len(pair_data.positive_pair_codes)}")
     print(f"skipped graph-only edges: {pair_data.skipped_missing_equation_edges}")
     print(f"skipped duplicate edges: {pair_data.skipped_duplicate_edges}")
+    print(
+        "model: "
+        f"feature_dim={args.feature_dim} "
+        f"equation_dim={equation_dim} "
+        "aggregation=sum_abs_mlp "
+        f"relation_hidden_dim={args.relation_hidden_dim} "
+        f"relation_bottleneck_dim={args.relation_bottleneck_dim}"
+    )
 
     train_dataset = ImplicationPairDataset(
         pair_data=pair_data,
@@ -283,9 +337,10 @@ def main() -> None:
     )
 
     model = ImplicationRelationModel(
+        equation_tensors=equation_data.tensors,
         max_variables=equation_data.max_variables,
         feature_dim=args.feature_dim,
-        equation_dim=args.equation_dim,
+        equation_dim=equation_dim,
         relation_hidden_dim=args.relation_hidden_dim,
         relation_bottleneck_dim=args.relation_bottleneck_dim,
         composition_hidden_dim=args.composition_hidden_dim,
@@ -302,18 +357,20 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         train_loss, train_accuracy = train_one_epoch(
             model=model,
-            equation_tensors=equation_data.tensors,
             loader=train_loader,
             optimizer=optimizer,
             loss_fn=loss_fn,
             device=device,
+            show_progress=show_progress,
+            epoch=epoch,
         )
         validation_loss, validation_accuracy = evaluate(
             model=model,
-            equation_tensors=equation_data.tensors,
             loader=validation_loader,
             loss_fn=loss_fn,
             device=device,
+            show_progress=show_progress,
+            epoch=epoch,
         )
 
         print(
@@ -323,9 +380,18 @@ def main() -> None:
         )
 
     if not args.no_save:
+        model_config = {
+            "feature_dim": args.feature_dim,
+            "equation_dim": equation_dim,
+            "composition_hidden_dim": args.composition_hidden_dim,
+            "relation_hidden_dim": args.relation_hidden_dim,
+            "relation_bottleneck_dim": args.relation_bottleneck_dim,
+            "dropout": args.dropout,
+        }
         checkpoint = {
             "model_state_dict": model.state_dict(),
             "args": vars(args),
+            "model_config": model_config,
             "max_variables": equation_data.max_variables,
             "num_equations": len(equation_data.tensors),
         }
