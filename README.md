@@ -1,32 +1,10 @@
 # SAIR Stage 1 Relation Model
 
-This repository contains a pedagogical version of the relation-model workflow
-used for SAIR Stage 1 implication prediction.
-
-The task is binary implication prediction:
-
-```text
-equation E_left  ->  equation E_right
-```
-
-The model has three inspectable stages:
-
-1. `postfix_equation_tensor.py` compiles each postfix equation into a flat
-   syntax table.
-2. `compiled_equation_encoder.py` batches those tables and maps each equation
-   index to a learned equation embedding.
-3. `relation_head.py` scores ordered pairs of equation embeddings with the
-   feature vector
-
-   ```text
-   [e_left ; e_right ; e_left - e_right ; e_left * e_right].
-   ```
-
-The equation encoder uses the symmetric aggregation
-
-```text
-[h_left + h_right ; |h_left - h_right|] -> MLP.
-```
+This is the companion repository for the blogpost
+[The SAIR distillation challenge stage 1](https://loss.md/posts/2026-05-04-sair-distillation-challenge-stage-1-postmortem/index.html).
+It contains the cleaned-up code and reproduction workflow for the
+relation-model tables and figures in the post. For motivation, interpretation,
+and details of the competition result, see the blogpost.
 
 ## Dependencies
 
